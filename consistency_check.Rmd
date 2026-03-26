@@ -1,0 +1,539 @@
+---
+title: "Data Consistency Analysis"
+subtitle: "Household Survey — Template"
+author: "Your Name"
+date: "`r Sys.Date()`"
+output:
+  pdf_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    latex_engine: pdflatex
+header-includes:
+  - \usepackage{booktabs}
+  - \usepackage{longtable}
+  - \usepackage{float}
+  - \floatplacement{table}{H}
+  - \usepackage{fancyhdr}
+  - \pagestyle{fancy}
+  - \fancyhead[L]{Data Consistency Analysis}
+  - \fancyhead[R]{Household Survey}
+  - \fancyfoot[C]{\thepage}
+---
+
+```{r setup, include=FALSE}
+packages <- c("readxl", "tidyverse", "knitr", "kableExtra")
+
+for(p in packages) {
+  if(!require(p, character.only = TRUE, quietly = TRUE)) {
+    install.packages(p, quiet = TRUE)
+    library(p, character.only = TRUE)
+  }
+}
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE)
+options(knitr.kable.NA = '-')
+```
+
+<!-- ================================================================== -->
+<!-- LAYER 1: INCIDENCE ACCUMULATOR                                      -->
+<!-- This list collects every finding as the document generates.         -->
+<!-- At the end, the accumulated incidences determine the ruling.        -->
+<!-- ================================================================== -->
+
+```{r incidence-system}
+incidences <- list(
+  critical = data.frame(Section = character(), Variable = character(), 
+                        Description = character(), N_Affected = integer(),
+                        stringsAsFactors = FALSE),
+  medium   = data.frame(Section = character(), Variable = character(), 
+                        Description = character(), N_Affected = integer(),
+                        stringsAsFactors = FALSE),
+  minor    = data.frame(Section = character(), Variable = character(), 
+                        Description = character(), N_Affected = integer(),
+                        stringsAsFactors = FALSE)
+)
+
+add_incidence <- function(severity, section, variable, description, n = NA) {
+  new_row <- data.frame(Section = section, Variable = variable, 
+                        Description = description, N_Affected = n,
+                        stringsAsFactors = FALSE)
+  if(severity == "critical")    incidences$critical <<- rbind(incidences$critical, new_row)
+  else if(severity == "medium") incidences$medium   <<- rbind(incidences$medium, new_row)
+  else                          incidences$minor    <<- rbind(incidences$minor, new_row)
+}
+```
+
+<!-- ================================================================== -->
+<!-- LOAD DATA                                                           -->
+<!-- Replace the path below with your own survey file.                   -->
+<!-- The sample survey has 6 sheets: ROSTER, DWELLING, INCOME,           -->
+<!-- FOOD_CONSUMPTION, HEALTH, EDUCATION                                 -->
+<!-- ================================================================== -->
+
+```{r load-data}
+data_path <- "data/sample_survey.xlsx"
+
+roster    <- read_excel(data_path, sheet = "ROSTER")
+dwelling  <- read_excel(data_path, sheet = "DWELLING")
+income    <- read_excel(data_path, sheet = "INCOME")
+food      <- read_excel(data_path, sheet = "FOOD_CONSUMPTION")
+health    <- read_excel(data_path, sheet = "HEALTH")
+education <- read_excel(data_path, sheet = "EDUCATION")
+
+roster <- roster %>% mutate(age_num = as.numeric(age))
+```
+
+\newpage
+
+# Executive Summary
+
+```{r summary-calcs}
+n_dwelling_rows <- nrow(dwelling)
+n_hh_unique     <- n_distinct(dwelling$hh_id)
+n_persons       <- nrow(roster)
+
+dup_hh    <- dwelling %>% group_by(hh_id) %>% filter(n() > 1)
+n_dup_hh  <- n_distinct(dup_hh$hh_id)
+
+heads_per_hh <- roster %>%
+  filter(relationship == "head") %>%
+  group_by(hh_id) %>%
+  summarise(n_heads = n(), .groups = "drop")
+
+hh_no_head  <- roster %>% distinct(hh_id) %>% anti_join(heads_per_hh, by = "hh_id")
+n_no_head   <- nrow(hh_no_head)
+
+has_critical <- (n_dup_hh > 0) | (n_no_head > 0)
+```
+
+| Concept | Count |
+|:--------|:------|
+| Dwelling records (rows) | `r format(n_dwelling_rows, big.mark=",")` |
+| Unique households | `r format(n_hh_unique, big.mark=",")` |
+| Persons (roster) | `r format(n_persons, big.mark=",")` |
+| Avg. persons per household | `r round(n_persons / n_hh_unique, 2)` |
+
+**Preliminary ruling:** `r ifelse(has_critical, "**REJECTED** — Critical incidences must be resolved before proceeding with analysis.", "**ACCEPTED WITH OBSERVATIONS** — The database can be used after minor corrections.")`
+
+\newpage
+
+# Duplicate Verification
+
+## Household ID Duplicates (Dwelling Sheet)
+
+Every household must appear exactly once in the dwelling sheet. Duplicates indicate a household was registered more than once.
+
+```{r dup-hh}
+if(n_dup_hh > 0) {
+  add_incidence("critical", "Duplicates", "hh_id (dwelling)",
+                paste(n_dup_hh, "duplicated hh_id"), nrow(dup_hh))
+}
+```
+
+**Result:** `r ifelse(n_dup_hh == 0, "No duplicate household IDs found.", paste("**CRITICAL:**", n_dup_hh, "hh_id values appear more than once, affecting", nrow(dup_hh), "records."))`
+
+```{r show-dups, results='asis'}
+if(n_dup_hh > 0) {
+  cat("\n**Duplicated hh_id:**\n\n")
+  for(id in unique(dup_hh$hh_id)) {
+    cat("- ", format(id, scientific = FALSE), "\n", sep="")
+  }
+}
+```
+
+## Person ID Duplicates (Roster)
+
+```{r dup-person}
+dup_person   <- roster %>% group_by(member_id) %>% filter(n() > 1)
+n_dup_person <- n_distinct(dup_person$member_id)
+
+if(n_dup_person > 0) {
+  add_incidence("critical", "Duplicates", "member_id",
+                paste(n_dup_person, "duplicated member_id"), nrow(dup_person))
+}
+```
+
+**Result:** `r ifelse(n_dup_person == 0, "All persons have a unique identifier.", paste("**CRITICAL:**", n_dup_person, "duplicated member_id values."))`
+
+\newpage
+
+# Household Composition (Roster)
+
+## Households Without Head
+
+Every household must have exactly one head (relationship = "head").
+
+```{r no-head}
+if(n_no_head > 0) {
+  add_incidence("critical", "Composition", "Head of household",
+                paste(n_no_head, "households without head"), n_no_head)
+}
+```
+
+**Result:** `r ifelse(n_no_head == 0, "All households have at least one head of household.", paste("**CRITICAL:**", n_no_head, "households have no head of household identified."))`
+
+```{r show-no-head, results='asis'}
+if(n_no_head > 0) {
+  cat("\n**hh_id without head:**\n\n")
+  for(id in hh_no_head$hh_id) {
+    cat("- ", format(id, scientific = FALSE), "\n", sep="")
+  }
+}
+```
+
+## Multiple Heads
+
+```{r multi-head}
+multi_head   <- heads_per_hh %>% filter(n_heads > 1)
+n_multi_head <- nrow(multi_head)
+
+if(n_multi_head > 0) {
+  add_incidence("medium", "Composition", "Multiple heads",
+                paste(n_multi_head, "households with >1 head"), n_multi_head)
+}
+```
+
+**Result:** `r ifelse(n_multi_head == 0, "All households have exactly one head.", paste("**MEDIUM:**", n_multi_head, "households have more than one head."))`
+
+## Head of Household Under Age 15
+
+```{r minor-head}
+minor_heads   <- roster %>% filter(relationship == "head" & age_num < 15)
+n_minor_heads <- nrow(minor_heads)
+
+if(n_minor_heads > 0) {
+  add_incidence("critical", "Composition", "Head under 15",
+                paste(n_minor_heads, "heads under 15"), n_minor_heads)
+}
+```
+
+**Result:** `r ifelse(n_minor_heads == 0, "All heads of household are 15 years or older.", paste("**CRITICAL:**", n_minor_heads, "heads of household are under 15 years old."))`
+
+\newpage
+
+# Dwelling Conditions — Missing Values
+
+These variables have no skip conditions and must be complete for all households.
+
+```{r dwelling-missing}
+mandatory_dwelling <- c("wall_material", "roof_material", "floor_material", 
+                        "n_rooms", "cooking_fuel", "main_water_source")
+
+dwelling_result <- data.frame(Variable = character(), N_Missing = integer(), 
+                              Result = character(), stringsAsFactors = FALSE)
+
+for(v in mandatory_dwelling) {
+  if(v %in% names(dwelling)) {
+    n_miss <- sum(is.na(dwelling[[v]]) | dwelling[[v]] %in% c("", "NULL", " "))
+    res <- ifelse(n_miss == 0, "OK", paste(n_miss, "missing"))
+    dwelling_result <- rbind(dwelling_result, data.frame(Variable = v, N_Missing = n_miss, Result = res))
+    if(n_miss > 0) {
+      add_incidence("medium", "Dwelling", v, paste(n_miss, "missing values"), n_miss)
+    }
+  }
+}
+
+kable(dwelling_result, booktabs = TRUE, 
+      caption = "Dwelling variables — missing values check") %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+
+\newpage
+
+# Dwelling — Skip Logic Verification
+
+```{r dwelling-skips}
+n_error_rent <- NA
+n_error_elec <- NA
+n_error_toilet <- NA
+
+# monthly_rent should only be answered if owns_dwelling = "no"
+if("monthly_rent" %in% names(dwelling)) {
+  error_rent <- dwelling %>%
+    filter(owns_dwelling == "yes" & !is.na(monthly_rent))
+  n_error_rent <- nrow(error_rent)
+  if(n_error_rent > 0) {
+    add_incidence("medium", "Dwelling", "monthly_rent (skip)",
+                  paste(n_error_rent, "owners reported rent"), n_error_rent)
+  }
+}
+
+# hours_electricity_day should only be answered if electricity_source != "none"
+if("hours_electricity_day" %in% names(dwelling)) {
+  error_elec <- dwelling %>%
+    filter(electricity_source == "none" & !is.na(hours_electricity_day))
+  n_error_elec <- nrow(error_elec)
+  if(n_error_elec > 0) {
+    add_incidence("medium", "Dwelling", "hours_electricity_day (skip)",
+                  paste(n_error_elec, "households without electricity reported hours"), n_error_elec)
+  }
+}
+
+# shared_toilet should only be answered if toilet_type != "none"
+if("shared_toilet" %in% names(dwelling)) {
+  error_toilet <- dwelling %>%
+    filter(toilet_type == "none" & !is.na(shared_toilet))
+  n_error_toilet <- nrow(error_toilet)
+  if(n_error_toilet > 0) {
+    add_incidence("medium", "Dwelling", "shared_toilet (skip)",
+                  paste(n_error_toilet, "households without toilet reported sharing"), n_error_toilet)
+  }
+}
+```
+
+| Question | Skip condition | Improper responses | Result |
+|:---------|:---------------|:-------------------|:-------|
+| Monthly rent | Only if owns_dwelling = "no" | `r ifelse(is.na(n_error_rent), "N/A", n_error_rent)` | `r ifelse(is.na(n_error_rent), "Variable not found", ifelse(n_error_rent == 0, "OK", paste(n_error_rent, "errors")))` |
+| Hours of electricity | Only if electricity_source ≠ "none" | `r ifelse(is.na(n_error_elec), "N/A", n_error_elec)` | `r ifelse(is.na(n_error_elec), "Variable not found", ifelse(n_error_elec == 0, "OK", paste(n_error_elec, "errors")))` |
+| Shared toilet | Only if toilet_type ≠ "none" | `r ifelse(is.na(n_error_toilet), "N/A", n_error_toilet)` | `r ifelse(is.na(n_error_toilet), "Variable not found", ifelse(n_error_toilet == 0, "OK", paste(n_error_toilet, "errors")))` |
+
+\newpage
+
+# Income Module — Skip Logic Verification
+
+```{r income-skips}
+n_error_activity <- NA
+n_error_remit <- NA
+
+# main_activity should only be answered if worked_last_30_days = "yes"
+if("main_activity" %in% names(income)) {
+  error_activity <- income %>%
+    filter(worked_last_30_days == "no" & !is.na(main_activity))
+  n_error_activity <- nrow(error_activity)
+  if(n_error_activity > 0) {
+    add_incidence("medium", "Income", "main_activity (skip)",
+                  paste(n_error_activity, "non-workers reported activity"), n_error_activity)
+  }
+}
+
+# remittance_amount should only be answered if received_remittances = "yes"
+if("remittance_amount" %in% names(income)) {
+  error_remit <- income %>%
+    filter(received_remittances == "no" & !is.na(remittance_amount))
+  n_error_remit <- nrow(error_remit)
+  if(n_error_remit > 0) {
+    add_incidence("medium", "Income", "remittance_amount (skip)",
+                  paste(n_error_remit, "non-recipients reported amount"), n_error_remit)
+  }
+}
+```
+
+| Question | Skip condition | Improper responses | Result |
+|:---------|:---------------|:-------------------|:-------|
+| Main activity | Only if worked_last_30_days = "yes" | `r ifelse(is.na(n_error_activity), "N/A", n_error_activity)` | `r ifelse(is.na(n_error_activity), "Variable not found", ifelse(n_error_activity == 0, "OK", paste(n_error_activity, "errors")))` |
+| Remittance amount | Only if received_remittances = "yes" | `r ifelse(is.na(n_error_remit), "N/A", n_error_remit)` | `r ifelse(is.na(n_error_remit), "Variable not found", ifelse(n_error_remit == 0, "OK", paste(n_error_remit, "errors")))` |
+
+\newpage
+
+# Food Consumption — Skip Logic Verification
+
+For each food group, days consumed and source should only be answered if the household reported consuming that food group.
+
+```{r food-skips}
+food_groups <- c("cereals", "roots_tubers", "legumes", "vegetables", "fruits", 
+                 "meat", "fish", "dairy", "oils_fats", "sugar")
+
+food_result <- data.frame(Food_Group = character(), N_Errors_Days = integer(), 
+                          N_Errors_Source = integer(), stringsAsFactors = FALSE)
+
+for(fg in food_groups) {
+  consumed_var <- paste0("consumed_", fg)
+  days_var     <- paste0("days_", fg)
+  source_var   <- paste0("source_", fg)
+  
+  n_err_days <- 0
+  n_err_source <- 0
+  
+  if(all(c(consumed_var, days_var) %in% names(food))) {
+    n_err_days <- food %>%
+      filter(.data[[consumed_var]] == "no" & !is.na(.data[[days_var]])) %>%
+      nrow()
+  }
+  
+  if(all(c(consumed_var, source_var) %in% names(food))) {
+    n_err_source <- food %>%
+      filter(.data[[consumed_var]] == "no" & !is.na(.data[[source_var]])) %>%
+      nrow()
+  }
+  
+  food_result <- rbind(food_result, data.frame(
+    Food_Group = fg, N_Errors_Days = n_err_days, N_Errors_Source = n_err_source))
+  
+  if(n_err_days > 0) {
+    add_incidence("medium", "Food consumption", paste0(days_var, " (skip)"),
+                  paste(n_err_days, "non-consumers reported days"), n_err_days)
+  }
+  if(n_err_source > 0) {
+    add_incidence("medium", "Food consumption", paste0(source_var, " (skip)"),
+                  paste(n_err_source, "non-consumers reported source"), n_err_source)
+  }
+}
+
+kable(food_result, booktabs = TRUE, col.names = c("Food group", "Days errors", "Source errors"),
+      caption = "Food consumption module — skip logic errors by food group") %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+
+\newpage
+
+# Health Module — Skip Logic Verification
+
+```{r health-skips}
+n_error_treatment <- NA
+n_error_coverage <- NA
+
+# sought_treatment should only be answered if illness_last_30_days = "yes"
+if("sought_treatment" %in% names(health)) {
+  error_treatment <- health %>%
+    filter(illness_last_30_days == "no" & !is.na(sought_treatment))
+  n_error_treatment <- nrow(error_treatment)
+  if(n_error_treatment > 0) {
+    add_incidence("medium", "Health", "sought_treatment (skip)",
+                  paste(n_error_treatment, "non-ill persons reported treatment-seeking"), n_error_treatment)
+  }
+}
+
+# coverage_type should only be answered if has_health_coverage = "yes"
+if("coverage_type" %in% names(health)) {
+  error_coverage <- health %>%
+    filter(has_health_coverage == "no" & !is.na(coverage_type))
+  n_error_coverage <- nrow(error_coverage)
+  if(n_error_coverage > 0) {
+    add_incidence("medium", "Health", "coverage_type (skip)",
+                  paste(n_error_coverage, "uncovered persons reported coverage type"), n_error_coverage)
+  }
+}
+```
+
+| Question | Skip condition | Improper responses | Result |
+|:---------|:---------------|:-------------------|:-------|
+| Sought treatment | Only if illness_last_30_days = "yes" | `r ifelse(is.na(n_error_treatment), "N/A", n_error_treatment)` | `r ifelse(is.na(n_error_treatment), "Variable not found", ifelse(n_error_treatment == 0, "OK", paste(n_error_treatment, "errors")))` |
+| Coverage type | Only if has_health_coverage = "yes" | `r ifelse(is.na(n_error_coverage), "N/A", n_error_coverage)` | `r ifelse(is.na(n_error_coverage), "Variable not found", ifelse(n_error_coverage == 0, "OK", paste(n_error_coverage, "errors")))` |
+
+\newpage
+
+# Education Module — Skip Logic Verification
+
+```{r education-skips}
+n_error_school <- NA
+
+# school_type should only be answered if currently_enrolled = "yes"
+if("school_type" %in% names(education)) {
+  error_school <- education %>%
+    filter(currently_enrolled == "no" & !is.na(school_type))
+  n_error_school <- nrow(error_school)
+  if(n_error_school > 0) {
+    add_incidence("medium", "Education", "school_type (skip)",
+                  paste(n_error_school, "non-enrolled persons reported school type"), n_error_school)
+  }
+}
+```
+
+**Result:** `r ifelse(is.na(n_error_school), "Variable not found.", ifelse(n_error_school == 0, "All records comply with the skip rule.", paste("**MEDIUM:**", n_error_school, "persons who are not currently enrolled reported a school type.")))`
+
+\newpage
+
+# Functional Screening — Missing Values (Roster)
+
+Four functional domains must be answered for all persons in the roster.
+
+```{r functional-check}
+func_vars <- c("func_mobility", "func_cognition", "func_vision", "func_daily_tasks")
+func_labels <- c("Mobility", "Cognition", "Vision", "Daily tasks")
+
+func_result <- data.frame(Domain = character(), Variable = character(),
+                          N_Missing = integer(), stringsAsFactors = FALSE)
+
+for(i in seq_along(func_vars)) {
+  var <- func_vars[i]
+  if(var %in% names(roster)) {
+    n_miss <- sum(is.na(roster[[var]]) | roster[[var]] %in% c("", "NULL", " "))
+    func_result <- rbind(func_result,
+                         data.frame(Domain = func_labels[i], Variable = var, N_Missing = n_miss))
+    if(n_miss > 0) {
+      add_incidence("medium", "Functional screening", func_labels[i],
+                    paste(n_miss, "missing responses"), n_miss)
+    }
+  }
+}
+
+kable(func_result, booktabs = TRUE,
+      caption = "Functional screening domains — missing values") %>%
+  kable_styling(latex_options = c("hold_position"))
+```
+
+\newpage
+
+# Incidence Summary
+
+```{r incidence-summary}
+n_critical <- nrow(incidences$critical)
+n_medium   <- nrow(incidences$medium)
+n_minor    <- nrow(incidences$minor)
+```
+
+| Severity | Count |
+|:---------|:------|
+| Critical | `r n_critical` |
+| Medium | `r n_medium` |
+| Minor | `r n_minor` |
+| **Total** | **`r n_critical + n_medium + n_minor`** |
+
+## Critical Incidences
+
+```{r show-critical, results='asis'}
+if(n_critical > 0) {
+  print(kable(incidences$critical, booktabs = TRUE, 
+              col.names = c("Section", "Variable", "Description", "N affected")) %>%
+        kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 9))
+} else {
+  cat("No critical incidences found.\n")
+}
+```
+
+## Medium Incidences
+
+```{r show-medium, results='asis'}
+if(n_medium > 0) {
+  print(kable(incidences$medium, booktabs = TRUE, 
+              col.names = c("Section", "Variable", "Description", "N affected")) %>%
+        kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 9))
+} else {
+  cat("No medium incidences found.\n")
+}
+```
+
+## Minor Incidences
+
+```{r show-minor, results='asis'}
+if(n_minor > 0) {
+  print(kable(incidences$minor, booktabs = TRUE, 
+              col.names = c("Section", "Variable", "Description", "N affected")) %>%
+        kable_styling(latex_options = c("hold_position", "scale_down"), font_size = 9))
+} else {
+  cat("No minor incidences found.\n")
+}
+```
+
+\newpage
+
+# Ruling
+
+```{r ruling}
+ruling <- if(n_critical > 0) "REJECTED" 
+          else if(n_medium > 0 | n_minor > 0) "ACCEPTED WITH OBSERVATIONS" 
+          else "ACCEPTED"
+```
+
+## Ruling: `r ruling`
+
+`r if(ruling == "REJECTED") "The database **cannot be used for analysis** in its current state due to the critical incidences identified above. The data provider must resolve these issues and resubmit the database. Re-run this document after corrections to verify."`
+
+`r if(ruling == "ACCEPTED WITH OBSERVATIONS") "The database **can be used for analysis** after addressing the medium and minor incidences documented above. These issues do not prevent analysis but should be documented and corrected where possible."`
+
+`r if(ruling == "ACCEPTED") "The database **is ready for analysis**. No incidences were found."`
+
+---
+
+*Document generated on `r Sys.Date()` — Re-run this .Rmd after any database correction to update all findings and the ruling automatically.*
